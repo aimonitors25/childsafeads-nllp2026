@@ -398,7 +398,6 @@ Averaging probabilities across six seeds, instead of selecting among them, is th
 
 Three observations that cost us time and may save someone else's.
 
-- **dev.jsonl is not valid JSONL.** Six of its 504 records span multiple physical lines, so the shipped load\_data.py and check\_submission.py both raise JSONDecodeError on the first instance. Naive line-parsing silently yields 503 of 504 — the dangerous failure, since it produces slightly wrong local scores with no error. train.jsonl and test.jsonl are clean. Streaming with json.JSONDecoder().raw\_decode reads all three correctly.
 - **Channel-disjoint is not brand-disjoint.** Two-thirds of dev and test instances promote a domain seen in training, and 119 of the 170 domains with three or more training instances carry a single ST1 label. A substantial share of ST1 and ST2 is reachable by memorising brands rather than by understanding the segment, which is worth knowing when reading any score on this benchmark.
 - **ST1's metric.** Macro-averaging over all five ST1 labels rather than reference-present ones changes the same predictions by \~0.13, because other has 2 training and 0 dev instances. We confirmed the leaderboard uses reference-present labels by matching a submission scored at 0.6185 to a local 0.6183.
 
@@ -752,7 +751,7 @@ python starting_kit_test/check_submission.py \\
 
 The validation instrument is separate from the build. `src/encoder.py --cv-folds 5 --cv-fold K` produces the out-of-fold predictions over train\+dev
 that every adoption decision in Sections 6a and 10a was made on; `src/data.py`
-holds the streaming loader that reads the malformed `dev.jsonl` correctly
+holds the streaming loader that reads the `dev.jsonl`
 (Section 8), and `src/metrics.py` the local replica of the leaderboard metric,
 validated to 0.0002 against a scored submission.
 

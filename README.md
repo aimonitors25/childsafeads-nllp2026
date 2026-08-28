@@ -222,9 +222,7 @@ itself marks `misleading_claim` on 54 % of instances.
 The joint-threshold result is the instructive one: **the more faithfully a tuning procedure
 models the metric's structure, the more effectively it fits the sample it is tuned on.**
 
-**Three release notes.** `dev.jsonl` **is not valid JSONL** — six of 504 records span multiple
-lines, so the shipped `load_data.py` raises on instance 0 and naive line-parsing silently
-yields 503 of 504. Splits are channel-disjoint but **not brand-disjoint** — two thirds of dev
+Splits are channel-disjoint but **not brand-disjoint** — two thirds of dev
 and test promote a domain seen in training. ST1 is macro-averaged over **reference-present
 labels only**; averaging over all five moves identical predictions by ~0.13. We confirmed the
 implementation by matching a submission scored 0.6185 to a local 0.6183.
@@ -256,7 +254,7 @@ python src/build/make_test_submission.py --tag "" --seeds 0 1 2 3 4 5 --st3-tag 
 
 | directory | what is in it |
 |---|---|
-| `src/core/` | data loading (including the `dev.jsonl` fix), the metric replica, the taxonomy constraint rules, submission writing |
+| `src/core/` | data loading, the metric replica, the taxonomy constraint rules, submission writing |
 | `src/models/` | the three arms — encoder, QLoRA specialist, classical TF-IDF |
 | `src/build/` | routing and assembly of a submission file |
 | `src/analysis/` | the cascade monitor, the regulator costing, the figures in this report |
