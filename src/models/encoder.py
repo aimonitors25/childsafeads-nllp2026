@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
-from data import ST1, ST2, ST3, load_split, view, clean_st3, _g
+from data import ST1, ST2, ST3, ST3_EXCLUSIVE, load_split, view, clean_st3, _g
 import metrics
 import submit
 
@@ -42,6 +42,15 @@ P.add_argument("--st1-weight", type=float, default=0.0,
                     "receive pos_weight, so `none` (1.5% of train) is almost never the "
                     "argmax -- recall 0.14. Three post-hoc corrections failed; this "
                     "fixes it in the loss instead.")
+P.add_argument("--span-weight", type=float, default=0.0,
+               help="Weight on an auxiliary token-tagging loss trained from `st3_evidence`. "
+                    "Each labelled instance ships the verbatim span that justifies each flag "
+                    "(2,892 on train, 95.7%% locatable, ~98%% coverage on the rare flags the "
+                    "classifier scores worst). 0.0 disables the head entirely -- no parameters "
+                    "are created and the RNG stream is untouched, so the baseline arm is "
+                    "bit-identical to the run without this flag.")
+P.add_argument("--span-pos-weight", type=float, default=20.0,
+               help="pos_weight for the token-level BCE. Evidence tokens are ~2%% of a sequence.")
 P.add_argument("--seed", type=int, default=0)
 P.add_argument("--out", default=None)
 P.add_argument("--tag", default="",
@@ -106,10 +115,49 @@ Y3 = mlb3.fit_transform([x["labels"]["st3"] for x in train]).astype(np.float32)
 y1 = np.array([ST1.index(x["labels"]["st1"]) for x in train])
 
 
+# The six flags that can carry evidence. `no_flag` and `insufficient_context`
+# are the exclusive ones and never do -- 0 spans across 2,857 labelled instances.
+SPAN_FLAGS = [f for f in ST3 if f not in ST3_EXCLUSIVE]
+
+
+def char_spans(inst, text):
+    """(start, end, flag_index) for every evidence quote locatable in `text`.
+
+    Quotes are verbatim from the instance's own transcript/description/page, so an
+    exact match succeeds for most; case-insensitive is the only fallback needed.
+    Quotes falling outside the level's view -- or past the view's own truncation --
+    are simply dropped, which is why the flag reports its own coverage below.
+    """
+    out, low = [], text.lower()
+    for e in (inst.get("labels") or {}).get("st3_evidence") or []:
+        f, q = e.get("flag"), (e.get("quote") or "").strip()
+        if f not in SPAN_FLAGS or len(q) < 8:
+            continue
+        j = text.find(q)
+        if j < 0:
+            j = low.find(q.lower())
+        if j >= 0:
+            out.append((j, j + len(q), SPAN_FLAGS.index(f)))
+    return out
+
+
 class DS(Dataset):
     def __init__(self, insts, y1=None, y2=None, y3=None):
         self.t = [view(x, A.level) for x in insts]
         self.y1, self.y2, self.y3 = y1, y2, y3
+        self.spans = self.mask = None
+        if A.span_weight and y1 is not None:
+            self.spans = [char_spans(x, t) for x, t in zip(insts, self.t)]
+            # Supervise a flag's channel when the instance is negative for it (no
+            # token is evidence) or positive *and* carrying a span. A positive flag
+            # whose quote we could not locate is masked out: absence of a span is
+            # not evidence of absence, and `undisclosed_advertising` -- a flag about
+            # something *not* being said -- ships a quote for only 53% of positives.
+            self.mask = []
+            for x, sp in zip(insts, self.spans):
+                pos, have = set(x["labels"]["st3"]), {k for _, _, k in sp}
+                self.mask.append([0.0 if (f in pos and k not in have) else 1.0
+                                  for k, f in enumerate(SPAN_FLAGS)])
 
     def __len__(self):
         return len(self.t)
@@ -118,16 +166,29 @@ class DS(Dataset):
         d = {"text": self.t[i]}
         if self.y1 is not None:
             d |= {"y1": self.y1[i], "y2": self.y2[i], "y3": self.y3[i]}
+        if self.spans is not None:
+            d |= {"spans": self.spans[i], "smask": self.mask[i]}
         return d
 
 
 def collate(batch):
+    want_off = "spans" in batch[0]
     enc = tok([b["text"] for b in batch], truncation=True, max_length=A.maxlen,
-              padding=True, return_tensors="pt")
+              padding=True, return_tensors="pt", return_offsets_mapping=want_off)
     if "y1" in batch[0]:
         enc["y1"] = torch.tensor([b["y1"] for b in batch])
         enc["y2"] = torch.tensor(np.array([b["y2"] for b in batch]))
         enc["y3"] = torch.tensor(np.array([b["y3"] for b in batch]))
+    if want_off:
+        off = enc.pop("offset_mapping").numpy()          # [B, T, 2]
+        Y = np.zeros((*off.shape[:2], len(SPAN_FLAGS)), dtype=np.float32)
+        for b, item in enumerate(batch):
+            for cs, ce, k in item["spans"]:
+                # a token is evidence if its character range overlaps the quote
+                hit = (off[b, :, 1] > cs) & (off[b, :, 0] < ce) & (off[b, :, 1] > off[b, :, 0])
+                Y[b, hit, k] = 1.0
+        enc["ytok"] = torch.from_numpy(Y)
+        enc["smask"] = torch.tensor(np.array([b["smask"] for b in batch], dtype=np.float32))
     return enc
 
 
@@ -138,12 +199,16 @@ class MultiTask(nn.Module):
         h = self.enc.config.hidden_size
         self.drop = nn.Dropout(0.1)
         self.h1, self.h2, self.h3 = nn.Linear(h, len(ST1)), nn.Linear(h, len(ST2)), nn.Linear(h, len(ST3))
+        # Created only when the auxiliary loss is on, so the baseline arm draws
+        # exactly the same random numbers as a run without the flag.
+        self.tok_head = nn.Linear(h, len(SPAN_FLAGS)) if A.span_weight else None
 
     def forward(self, input_ids, attention_mask, **_):
         out = self.enc(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         m = attention_mask.unsqueeze(-1).float()
         pooled = self.drop((out * m).sum(1) / m.sum(1).clamp(min=1e-6))  # mean-pool
-        return self.h1(pooled), self.h2(pooled), self.h3(pooled)
+        tok_logits = self.tok_head(out) if self.tok_head is not None else None
+        return self.h1(pooled), self.h2(pooled), self.h3(pooled), tok_logits
 
 
 def pos_weight(Y, cap=20.0):
@@ -168,6 +233,18 @@ else:
     ce = nn.CrossEntropyLoss()
 b2 = nn.BCEWithLogitsLoss(pos_weight=pos_weight(Y2))
 b3 = nn.BCEWithLogitsLoss(pos_weight=pos_weight(Y3))
+btok = nn.BCEWithLogitsLoss(reduction="none",
+                            pos_weight=torch.full((len(SPAN_FLAGS),), A.span_pos_weight,
+                                                  device=dev)) if A.span_weight else None
+if A.span_weight:
+    _sp = [char_spans(x, view(x, A.level)) for x in train]
+    _tot = sum(len((x["labels"].get("st3_evidence") or [])) for x in train)
+    _pos = sum(1 for x in train if x["labels"]["st3"] and
+               set(x["labels"]["st3"]) - ST3_EXCLUSIVE)
+    print(f"span supervision: {sum(len(z) for z in _sp)} of {_tot} evidence quotes located "
+          f"inside the L{A.level} view, on {sum(1 for z in _sp if z)}/{len(train)} training "
+          f"instances ({_pos} of which carry at least one span-eligible flag); "
+          f"weight={A.span_weight} pos_weight={A.span_pos_weight}", flush=True)
 
 # No GradScaler: loss scaling exists to stop fp16 gradients underflowing, and
 # bfloat16 carries fp32's exponent range. It was harmless with ModernBERT and
@@ -178,8 +255,14 @@ for ep in range(A.epochs):
     for i, batch in enumerate(dl):
         batch = {k: v.to(dev) for k, v in batch.items()}
         with torch.autocast(dev, dtype=torch.bfloat16):
-            o1, o2, o3 = model(**batch)
-            loss = (ce(o1, batch["y1"]) + b2(o2, batch["y2"]) + b3(o3, batch["y3"])) / A.accum
+            o1, o2, o3, otok = model(**batch)
+            loss = ce(o1, batch["y1"]) + b2(o2, batch["y2"]) + b3(o3, batch["y3"])
+            if otok is not None:
+                # mask: real tokens x supervised flag channels
+                w = batch["attention_mask"].unsqueeze(-1).float() * batch["smask"].unsqueeze(1)
+                l = btok(otok.float(), batch["ytok"]) * w
+                loss = loss + A.span_weight * (l.sum() / w.sum().clamp(min=1.0))
+            loss = loss / A.accum
         loss.backward()
         if (i + 1) % A.accum == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -195,7 +278,7 @@ def infer(insts):
     for batch in DataLoader(DS(insts), batch_size=16, collate_fn=collate):
         batch = {k: v.to(dev) for k, v in batch.items()}
         with torch.autocast(dev, dtype=torch.bfloat16):
-            o1, o2, o3 = model(**batch)
+            o1, o2, o3, _ = model(**batch)
         p1.append(o1.float().softmax(-1).cpu().numpy())
         p2.append(o2.float().sigmoid().cpu().numpy())
         p3.append(o3.float().sigmoid().cpu().numpy())
